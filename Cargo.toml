@@ -1,0 +1,25 @@
+[package]
+authors = ["Thomas Sieverding <Thomas@bajix.com>"]
+description = "An efficient way to spawn up to 64 concurrent Futures in WASM"
+documentation = "https://docs.rs/spawn64"
+license = "MIT"
+name = "spawn64"
+repository = "https://github.com/Bajix/spawn64"
+readme = "./README.md"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+bitintr = "0.3.0"
+const-array-init = "1.0.0"
+js-sys = "0.3.69"
+
+[target.'cfg(target_arch = "wasm32")'.dev-dependencies]
+wasm-bindgen-futures = "0.4"
+wasm-bindgen-test = "0.3"
+futures-channel = "0.3.30"
+
+[build]
+target = "wasm32-unknown-unknown"
