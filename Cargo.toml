@@ -1,6 +1,6 @@
 [package]
 authors = ["Thomas Sieverding <Thomas@bajix.com>"]
-description = "An efficient way to spawn up to 64 concurrent Futures in WASM"
+description = "An efficient way to spawn up to 64 concurrent futures in WASM"
 documentation = "https://docs.rs/spawn64"
 license = "MIT"
 name = "spawn64"
