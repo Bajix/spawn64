@@ -1,4 +1,3 @@
-use bitintr::Blcic;
 use const_array_init::const_arr;
 use js_sys::{
     wasm_bindgen::{closure::Closure, JsValue},
@@ -125,7 +124,8 @@ impl Runtime {
     fn next_slot(&self) -> Option<u32> {
         let occupancy = self.occupancy.load(Ordering::Acquire);
 
-        let least_significant_bit = occupancy.blcic();
+        // Isolate lowest clear bit. See https://docs.rs/bitintr/latest/bitintr/trait.Blcic.html
+        let least_significant_bit = !occupancy & (occupancy.wrapping_add(1));
 
         if least_significant_bit.ne(&0) {
             self.occupancy
@@ -159,9 +159,9 @@ pub fn spawn_local<F>(future: F)
 where
     F: Future<Output = ()> + 'static,
 {
-    let idx = RUNTIME
-        .next_slot()
-        .expect("`spawn64` can only manage 64 concurrent futures. Use `wasm-bindgen-futures` instead");
+    let idx = RUNTIME.next_slot().expect(
+        "`spawn64` can only manage 64 concurrent futures. Use `wasm-bindgen-futures` instead",
+    );
 
     let handle = &RUNTIME.tasks[idx as usize];
 
