@@ -91,6 +91,7 @@ impl<'a> Index<'a> {
     }
 
     #[inline(always)]
+    #[cfg(not(feature = "strict_provenance"))]
     pub(crate) unsafe fn from_raw(ptr: *mut ()) -> Self {
         Self {
             arena: &*((ptr as usize & IDX_MASK) as *const TaskArena),
@@ -99,8 +100,24 @@ impl<'a> Index<'a> {
     }
 
     #[inline(always)]
+    #[cfg(feature = "strict_provenance")]
+    pub(crate) unsafe fn from_raw(ptr: *mut ()) -> Self {
+        Self {
+            arena: &*(ptr.map_addr(|addr| addr & IDX_MASK) as *const TaskArena),
+            idx: ptr as usize & IDX,
+        }
+    }
+
+    #[inline(always)]
+    #[cfg(not(feature = "strict_provenance"))]
     pub(crate) fn into_raw(self) -> *mut () {
         ((addr_of!(*self.arena) as usize) | self.idx) as *mut ()
+    }
+
+    #[inline(always)]
+    #[cfg(feature = "strict_provenance")]
+    pub(crate) fn into_raw(self) -> *mut () {
+        addr_of!(*self.arena).map_addr(|addr| addr | self.idx) as *mut ()
     }
 }
 

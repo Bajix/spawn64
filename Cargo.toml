@@ -23,3 +23,9 @@ futures-channel = "0.3.30"
 
 [build]
 target = "wasm32-unknown-unknown"
+
+[features]
+default = []
+
+# Enable unstable `strict_provenance` language feature. See tracking issue: https://github.com/rust-lang/rust/issues/95228
+strict_provenance = []

@@ -1,3 +1,5 @@
+#![cfg_attr(feature = "strict_provenance", feature(strict_provenance))]
+
 #[cfg(any(target_arch = "wasm32", doc))]
 mod arena;
 #[cfg(any(target_arch = "wasm32", doc))]
