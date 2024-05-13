@@ -4,18 +4,47 @@ use js_sys::{
 };
 use std::sync::atomic::Ordering;
 use std::{future::Future, ptr, sync::atomic::AtomicPtr};
+use wasm_bindgen::prelude::*;
+
+#[wasm_bindgen]
+extern "C" {
+    #[wasm_bindgen]
+    fn queueMicrotask(closure: &Closure<dyn FnMut(JsValue)>);
+
+    type Global;
+
+    #[wasm_bindgen(method, getter, js_name = queueMicrotask)]
+    fn hasQueueMicrotask(this: &Global) -> JsValue;
+}
 
 use crate::arena::{Index, TaskArena};
-pub(crate) struct Scheduler {
-    promise: Promise,
-    callback: Closure<dyn FnMut(JsValue)>,
+
+pub(crate) enum Scheduler {
+    Microtask {
+        poll_enqueued: Closure<dyn FnMut(JsValue)>,
+    },
+    Promise {
+        promise: Promise,
+        poll_enqueued: Closure<dyn FnMut(JsValue)>,
+    },
 }
 
 impl Scheduler {
     fn new() -> Self {
-        Scheduler {
-            promise: Promise::resolve(&JsValue::undefined()),
-            callback: Closure::new(|_| unsafe { RUNTIME.poll_enqueued() }),
+        let has_queue_microtask = js_sys::global()
+            .unchecked_into::<Global>()
+            .hasQueueMicrotask()
+            .is_function();
+
+        let poll_enqueued = Closure::new(|_| unsafe { RUNTIME.poll_enqueued() });
+
+        if has_queue_microtask {
+            Scheduler::Microtask { poll_enqueued }
+        } else {
+            Scheduler::Promise {
+                promise: Promise::resolve(&JsValue::undefined()),
+                poll_enqueued,
+            }
         }
     }
 
@@ -26,8 +55,16 @@ impl Scheduler {
 
         RUNTIME.head.store(head, Ordering::Release);
 
-        SCHEDULER.with(|scheduler| {
-            let _ = scheduler.promise.then(&scheduler.callback);
+        SCHEDULER.with(|scheduler| match scheduler {
+            Scheduler::Microtask { poll_enqueued } => {
+                queueMicrotask(poll_enqueued);
+            }
+            Scheduler::Promise {
+                promise,
+                poll_enqueued,
+            } => {
+                let _ = promise.then(poll_enqueued);
+            }
         });
     }
 }
