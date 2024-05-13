@@ -13,6 +13,7 @@ impl TaskHandle {
         }
     }
 
+    #[inline(always)]
     pub(crate) unsafe fn task_mut(
         &self,
     ) -> &mut Option<Pin<Box<dyn Future<Output = ()> + 'static>>> {

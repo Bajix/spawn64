@@ -27,6 +27,10 @@ impl<'a> Index<'a> {
         &self.arena.tasks[self.idx]
     }
 
+    fn has_task(&self) -> bool {
+        (self.arena.occupancy.load(Ordering::Acquire) & (1 << self.idx)).ne(&0)
+    }
+
     fn raw_waker(&self) -> RawWaker {
         unsafe fn clone(ptr: *const ()) -> RawWaker {
             RawWaker::new(ptr, &VTABLE)
@@ -34,17 +38,20 @@ impl<'a> Index<'a> {
 
         unsafe fn wake(ptr: *const ()) {
             let slot = Index::from_raw(ptr as *mut ());
-            let handle = slot.handle();
 
-            let next = handle.next.load(Ordering::Acquire) as *const ();
+            if slot.has_task() {
+                let handle = slot.handle();
 
-            if next.is_null() {
-                let tail = RUNTIME.tail.swap(ptr as *mut (), Ordering::AcqRel);
+                let next = handle.next.load(Ordering::Acquire) as *const ();
 
-                if tail.is_null() {
-                    Scheduler::schedule_polling(ptr as *mut ());
-                } else if tail.ne(&(ptr as *mut ())) {
-                    handle.next.store(tail, Ordering::Release);
+                if next.is_null() {
+                    let tail = RUNTIME.tail.swap(ptr as *mut (), Ordering::AcqRel);
+
+                    if tail.is_null() {
+                        Scheduler::schedule_polling(ptr as *mut ());
+                    } else if tail.ne(&(ptr as *mut ())) {
+                        handle.next.store(tail, Ordering::Release);
+                    }
                 }
             }
         }
