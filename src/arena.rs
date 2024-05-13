@@ -23,14 +23,17 @@ pub(crate) struct Index<'a> {
 }
 
 impl<'a> Index<'a> {
+    #[inline(always)]
     pub(crate) fn handle(&self) -> &TaskHandle {
         &self.arena.tasks[self.idx]
     }
 
+    #[inline(always)]
     fn has_task(&self) -> bool {
         (self.arena.occupancy.load(Ordering::Acquire) & (1 << self.idx)).ne(&0)
     }
 
+    #[inline(always)]
     fn raw_waker(&self) -> RawWaker {
         unsafe fn clone(ptr: *const ()) -> RawWaker {
             RawWaker::new(ptr, &VTABLE)
@@ -63,6 +66,7 @@ impl<'a> Index<'a> {
         RawWaker::new(self.into_raw(), &VTABLE)
     }
 
+    #[inline(always)]
     pub(crate) unsafe fn poll(&self) -> *mut () {
         let handle = self.handle();
 
@@ -86,6 +90,7 @@ impl<'a> Index<'a> {
         handle.next.swap(ptr::null_mut(), Ordering::AcqRel)
     }
 
+    #[inline(always)]
     pub(crate) unsafe fn from_raw(ptr: *mut ()) -> Self {
         Self {
             arena: &*((ptr as usize & IDX_MASK) as *const TaskArena),
@@ -93,6 +98,7 @@ impl<'a> Index<'a> {
         }
     }
 
+    #[inline(always)]
     pub(crate) fn into_raw(self) -> *mut () {
         ((addr_of!(*self.arena) as usize) | self.idx) as *mut ()
     }
