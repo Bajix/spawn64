@@ -111,7 +111,7 @@ where
     let index = RUNTIME.arena.next_index();
 
     unsafe {
-        *index.handle().task_mut() = Some(Box::pin(future));
+        *index.handle().task.get() = Some(Box::pin(future));
     }
 
     let ptr = index.into_raw();

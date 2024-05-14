@@ -1,17 +1,16 @@
 use std::{
+    cell::UnsafeCell,
+    future::Future,
+    pin::Pin,
     ptr::{self, addr_of},
-    sync::atomic::{AtomicU64, Ordering},
+    sync::atomic::{AtomicPtr, AtomicU64, Ordering},
     task::{Context, Poll, RawWaker, RawWakerVTable, Waker},
-    usize,
 };
 
 use const_array_init::const_arr;
 use once_cell::race::OnceBox;
 
-use crate::{
-    handle::TaskHandle,
-    runtime::{Scheduler, RUNTIME},
-};
+use crate::runtime::{Scheduler, RUNTIME};
 
 const IDX: usize = (1 << 6) - 1;
 const IDX_MASK: usize = !IDX;
@@ -70,7 +69,7 @@ impl<'a> Index<'a> {
     pub(crate) unsafe fn poll(&self) -> *mut () {
         let handle = self.handle();
 
-        let poll = match handle.task_mut() {
+        let poll = match &mut *handle.task.get() {
             Some(task) => {
                 let waker = Waker::from_raw(self.raw_waker());
                 let mut cx = Context::from_waker(&waker);
@@ -81,7 +80,7 @@ impl<'a> Index<'a> {
         };
 
         if poll.eq(&Some(Poll::Ready(()))) {
-            *handle.task_mut() = None;
+            *handle.task.get() = None;
             self.arena
                 .occupancy
                 .fetch_and(!(1 << self.idx), Ordering::Release);
@@ -94,7 +93,7 @@ impl<'a> Index<'a> {
     #[cfg(not(feature = "strict_provenance"))]
     pub(crate) unsafe fn from_raw(ptr: *mut ()) -> Self {
         Self {
-            arena: &*((ptr as usize & IDX_MASK) as *const TaskArena),
+            arena: &*((ptr as usize & IDX_MASK) as *const _),
             idx: ptr as usize & IDX,
         }
     }
@@ -103,7 +102,7 @@ impl<'a> Index<'a> {
     #[cfg(feature = "strict_provenance")]
     pub(crate) unsafe fn from_raw(ptr: *mut ()) -> Self {
         Self {
-            arena: &*(ptr.map_addr(|addr| addr & IDX_MASK) as *const TaskArena),
+            arena: &*(ptr.map_addr(|addr| addr & IDX_MASK) as *const _),
             idx: ptr as usize & IDX,
         }
     }
@@ -121,6 +120,20 @@ impl<'a> Index<'a> {
     }
 }
 
+pub(crate) struct TaskHandle {
+    pub(crate) task: UnsafeCell<Option<Pin<Box<dyn Future<Output = ()> + 'static>>>>,
+    pub(crate) next: AtomicPtr<()>,
+}
+
+impl TaskHandle {
+    pub(crate) const fn new() -> Self {
+        TaskHandle {
+            task: UnsafeCell::new(None),
+            next: AtomicPtr::new(ptr::null_mut()),
+        }
+    }
+}
+
 #[repr(align(64))]
 pub(crate) struct TaskArena {
     occupancy: AtomicU64,
@@ -132,6 +145,7 @@ impl TaskArena {
     pub(crate) const fn new() -> Self {
         TaskArena {
             occupancy: AtomicU64::new(0),
+            #[allow(clippy::declare_interior_mutable_const)]
             tasks: const_arr!([TaskHandle; 64], |_| TaskHandle::new()),
             next: OnceBox::new(),
         }
