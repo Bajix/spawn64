@@ -1,9 +1,13 @@
+use std::{
+    future::Future,
+    ptr,
+    sync::atomic::{AtomicPtr, Ordering},
+};
+
 use js_sys::{
     wasm_bindgen::{closure::Closure, JsValue},
     Promise,
 };
-use std::sync::atomic::Ordering;
-use std::{future::Future, ptr, sync::atomic::AtomicPtr};
 use wasm_bindgen::prelude::*;
 
 #[wasm_bindgen]
@@ -130,16 +134,17 @@ where
 
 #[cfg(all(test, target_arch = "wasm32"))]
 mod tests {
+    use std::ops::FnMut;
+
     use futures_channel::oneshot;
     use js_sys::{
         wasm_bindgen::{closure::Closure, JsValue},
         Promise,
     };
     use wasm_bindgen_futures::JsFuture;
+    use wasm_bindgen_test::*;
 
     use super::spawn_local;
-    use std::ops::FnMut;
-    use wasm_bindgen_test::*;
 
     #[wasm_bindgen_test]
     async fn spawn_local_runs() {
