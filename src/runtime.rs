@@ -1,6 +1,6 @@
 use std::{
     future::Future,
-    ptr,
+    ptr::{self, addr_of},
     sync::atomic::{AtomicPtr, Ordering},
 };
 
@@ -21,7 +21,7 @@ extern "C" {
     fn hasQueueMicrotask(this: &Global) -> JsValue;
 }
 
-use crate::arena::{Index, TaskArena};
+use crate::arena::{FreeList, Index, TaskArena};
 
 pub(crate) enum Scheduler {
     Microtask {
@@ -76,7 +76,9 @@ impl Scheduler {
 pub(crate) struct Runtime {
     pub(crate) head: AtomicPtr<()>,
     pub(crate) tail: AtomicPtr<()>,
-    arena: TaskArena,
+    pub(crate) next: AtomicPtr<()>,
+    pub(crate) arena: TaskArena,
+    pub(crate) free_list: FreeList<TaskArena>,
 }
 
 unsafe impl Sync for Runtime {}
@@ -88,7 +90,9 @@ impl Runtime {
         Runtime {
             head: AtomicPtr::new(ptr::null_mut()),
             tail: AtomicPtr::new(ptr::null_mut()),
+            next: AtomicPtr::new(ptr::null_mut()),
             arena: TaskArena::new(),
+            free_list: FreeList::new(),
         }
     }
 
@@ -98,8 +102,34 @@ impl Runtime {
         self.tail.store(ptr::null_mut(), Ordering::Release);
 
         while !head.is_null() {
-            head = Index::from_raw(head).poll();
+            head = Index::<TaskArena>::from_raw(head).poll();
         }
+    }
+
+    #[inline(always)]
+    fn next(&'static self) -> (*mut (), Index<TaskArena>) {
+        let (ptr, index) = {
+            let ptr = RUNTIME.next.load(Ordering::Acquire);
+
+            if ptr.is_null() {
+                unsafe { *RUNTIME.free_list.slots[0].get() = addr_of!(RUNTIME.arena) };
+                (
+                    addr_of!(RUNTIME.arena.tasks[0]) as *mut (),
+                    Index::new(&RUNTIME.arena, 0),
+                )
+            } else {
+                unsafe { (ptr, Index::from_raw(ptr)) }
+            }
+        };
+
+        let occupancy = index.set_as_occupied();
+
+        RUNTIME.next.store(
+            index.next_index(Some(occupancy)).into_raw(),
+            Ordering::Release,
+        );
+
+        (ptr, index)
     }
 }
 
@@ -108,19 +138,17 @@ pub fn spawn_local<F>(future: F)
 where
     F: Future<Output = ()> + 'static,
 {
-    let index = RUNTIME.arena.next_index();
+    let (ptr, index) = RUNTIME.next();
 
     unsafe {
         *index.handle().task.get() = Some(Box::pin(future));
     }
 
-    let ptr = index.into_raw();
-
     let tail = RUNTIME.tail.swap(ptr, Ordering::AcqRel);
 
     if !tail.is_null() {
         unsafe {
-            Index::from_raw(tail)
+            Index::<TaskArena>::from_raw(tail)
                 .handle()
                 .next
                 .store(ptr, Ordering::Release);
