@@ -1,7 +1,8 @@
 use std::{
     cell::UnsafeCell,
     future::Future,
-    mem::{self},
+    hint::unreachable_unchecked,
+    mem,
     pin::Pin,
     ptr::{self, addr_of},
     sync::atomic::{AtomicPtr, AtomicU64, Ordering},
@@ -171,78 +172,99 @@ impl<'a, T> Index<'a, T> {
     }
 }
 
-impl<'a, T> Index<'a, FreeList<T>>
-where
-    T: for<'b> From<&'b Index<'b, FreeList<T>>>,
-{
-    #[inline(always)]
+macro_rules! impl_free_list_index {
+    ($ty: ty) => {
+        impl<'a> Index<'a, FreeList<$ty>> {
+            fn set_as_full(&self) -> u64 {
+                let full_bit = 1 << self.idx;
+                let full = self.list.full.fetch_or(full_bit, Ordering::AcqRel) | full_bit;
+
+                if full.eq(&u64::MAX) {
+                    if let Some(index) = self.list.owning_index() {
+                        index.set_as_full();
+                    }
+                }
+
+                full
+            }
+
+            fn set_as_available(&self) {
+                let was_full = self.list.full.fetch_and(!(1 << self.idx), Ordering::AcqRel);
+
+                if was_full.eq(&u64::MAX) {
+                    if let Some(index) = self.list.owning_index() {
+                        index.set_as_available();
+                    }
+                }
+            }
+
+            fn next_index(&'a self, full: Option<u64>) -> Index<'a, $ty> {
+                let full = full.unwrap_or_else(|| self.list.full.load(Ordering::Acquire));
+
+                // Isolate lowest clear bit.
+                let low_bit = !full & (full.wrapping_add(1));
+
+                if low_bit.ne(&0) {
+                    let idx = low_bit.trailing_zeros() as usize;
+                    Index::new(self.list.get_or_init_index(idx), idx)
+                } else {
+                    // The list has no clear bits; it is full
+
+                    if let Some(index) = self.list.owning_index() {
+                        let full = index.set_as_full();
+                        let freelist_index = index.next_index(Some(full));
+                        let index = freelist_index.next_index(None);
+
+                        // Unify `a lifetime
+                        unsafe { mem::transmute::<Index<'_, $ty>, Index<'a, $ty>>(index) }
+                    } else {
+                        // Create owning list for the current full list and a sibling
+                        let mut parent: Box<FreeList<FreeList<$ty>>> =
+                            Box::new(FreeList::default());
+
+                        // Add as first list but mark as full
+                        *parent.full.get_mut() = 1;
+                        *parent.slots[0].get_mut() = addr_of!(*self.list);
+
+                        let mut sibling: Box<FreeList<$ty>> = Box::new(FreeList::default());
+                        *sibling.parent.get_mut() = Index::new(&parent, 1).into_raw();
+
+                        let index = Index::new(sibling.get_or_init_index(0), 0);
+
+                        // Unify `a lifetime
+                        let index =
+                            unsafe { mem::transmute::<Index<'_, $ty>, Index<'a, $ty>>(index) };
+
+                        *parent.slots[1].get_mut() = Box::into_raw(sibling) as *const FreeList<$ty>;
+
+                        self.list
+                            .parent
+                            .store(Box::into_raw(parent) as *mut (), Ordering::Release);
+
+                        index
+                    }
+                }
+            }
+        }
+    };
+}
+
+impl_free_list_index!(TaskArena);
+impl_free_list_index!(FreeList<TaskArena>);
+impl_free_list_index!(FreeList<FreeList<TaskArena>>);
+
+impl<'a> Index<'a, FreeList<FreeList<FreeList<FreeList<TaskArena>>>>> {
     fn set_as_full(&self) -> u64 {
-        let full_bit = 1 << self.idx;
-        let full = self.list.full.fetch_or(full_bit, Ordering::AcqRel) | full_bit;
-
-        if full.eq(&u64::MAX) {
-            if let Some(index) = self.list.owning_index() {
-                index.set_as_full();
-            }
-        }
-
-        full
+        unsafe { unreachable_unchecked() }
     }
-
     fn set_as_available(&self) {
-        let was_full = self.list.full.fetch_and(!(1 << self.idx), Ordering::AcqRel);
-
-        if was_full.eq(&u64::MAX) {
-            if let Some(index) = self.list.owning_index() {
-                index.set_as_available();
-            }
-        }
+        unsafe { unreachable_unchecked() }
     }
-
-    fn next_index(&'a self, full: Option<u64>) -> Index<'a, T> {
-        let full = full.unwrap_or_else(|| self.list.full.load(Ordering::Acquire));
-
-        // Isolate lowest clear bit.
-        let low_bit = !full & (full.wrapping_add(1));
-
-        if low_bit.ne(&0) {
-            let idx = low_bit.trailing_zeros() as usize;
-            Index::new(self.list.get_or_init_index(idx), idx)
-        } else {
-            // The list has no clear bits; it is full
-
-            if let Some(index) = self.list.owning_index() {
-                let full = index.set_as_full();
-                let freelist_index = index.next_index(Some(full));
-                let index = freelist_index.next_index(None);
-
-                // Unify `a lifetime
-                unsafe { mem::transmute::<Index<'_, T>, Index<'a, T>>(index) }
-            } else {
-                // Create owning list for the current full list and a sibling
-                let mut parent: Box<FreeList<FreeList<T>>> = Box::new(FreeList::default());
-
-                // Add as first list but mark as full
-                *parent.full.get_mut() = 1;
-                *parent.slots[0].get_mut() = addr_of!(*self.list);
-
-                let mut sibling: Box<FreeList<T>> = Box::new(FreeList::default());
-                *sibling.parent.get_mut() = Index::new(&parent, 1).into_raw();
-
-                let index = Index::new(sibling.get_or_init_index(0), 0);
-
-                // Unify `a lifetime
-                let index = unsafe { mem::transmute::<Index<'_, T>, Index<'a, T>>(index) };
-
-                *parent.slots[1].get_mut() = Box::into_raw(sibling) as *const FreeList<T>;
-
-                self.list
-                    .parent
-                    .store(Box::into_raw(parent) as *mut (), Ordering::Release);
-
-                index
-            }
-        }
+    fn next_index(
+        &'a self,
+        _full: Option<u64>,
+    ) -> Index<'a, FreeList<FreeList<FreeList<TaskArena>>>> {
+        unsafe { unreachable_unchecked() }
     }
 }
 
