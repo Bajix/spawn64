@@ -1,6 +1,6 @@
 use std::{
     future::Future,
-    ptr,
+    ptr::{self, addr_of},
     sync::atomic::{AtomicPtr, Ordering},
 };
 
@@ -57,7 +57,7 @@ impl Scheduler {
             static SCHEDULER: Scheduler = Scheduler::new();
         }
 
-        RUNTIME.head.store(head, Ordering::Release);
+        RUNTIME.poll_head.store(head, Ordering::Release);
 
         SCHEDULER.with(|scheduler| match scheduler {
             Scheduler::Microtask { poll_enqueued } => {
@@ -74,8 +74,10 @@ impl Scheduler {
 }
 
 pub(crate) struct Runtime {
-    pub(crate) head: AtomicPtr<()>,
-    pub(crate) tail: AtomicPtr<()>,
+    pub(crate) poll_head: AtomicPtr<()>,
+    pub(crate) poll_tail: AtomicPtr<()>,
+    pub(crate) free_tail: AtomicPtr<()>,
+    pub(crate) next: AtomicPtr<()>,
     arena: TaskArena,
 }
 
@@ -86,16 +88,18 @@ pub(crate) static RUNTIME: Runtime = Runtime::new();
 impl Runtime {
     const fn new() -> Self {
         Runtime {
-            head: AtomicPtr::new(ptr::null_mut()),
-            tail: AtomicPtr::new(ptr::null_mut()),
+            poll_head: AtomicPtr::new(ptr::null_mut()),
+            poll_tail: AtomicPtr::new(ptr::null_mut()),
+            free_tail: AtomicPtr::new(ptr::null_mut()),
+            next: AtomicPtr::new(ptr::null_mut()),
             arena: TaskArena::new(),
         }
     }
 
     unsafe fn poll_enqueued(&'static self) {
-        let mut head = self.head.swap(ptr::null_mut(), Ordering::AcqRel);
+        let mut head = self.poll_head.swap(ptr::null_mut(), Ordering::AcqRel);
 
-        self.tail.store(ptr::null_mut(), Ordering::Release);
+        self.poll_tail.store(ptr::null_mut(), Ordering::Release);
 
         while !head.is_null() {
             head = Index::from_raw(head).poll();
@@ -108,21 +112,36 @@ pub fn spawn_local<F>(future: F)
 where
     F: Future<Output = ()> + 'static,
 {
-    let index = RUNTIME.arena.next_index();
+    let (ptr, index) = {
+        let ptr = RUNTIME.next.load(Ordering::Acquire);
+
+        if ptr.is_null() {
+            (
+                addr_of!(RUNTIME.arena) as *mut (),
+                Index::new(&RUNTIME.arena, 0),
+            )
+        } else {
+            unsafe { (ptr, Index::from_raw(ptr)) }
+        }
+    };
+
+    let occupancy = index.set_as_occupied();
+
+    RUNTIME
+        .next
+        .store(index.next_index(occupancy).into_raw(), Ordering::Release);
 
     unsafe {
         *index.handle().task.get() = Some(Box::pin(future));
     }
 
-    let ptr = index.into_raw();
-
-    let tail = RUNTIME.tail.swap(ptr, Ordering::AcqRel);
+    let tail = RUNTIME.poll_tail.swap(ptr, Ordering::AcqRel);
 
     if !tail.is_null() {
         unsafe {
             Index::from_raw(tail)
                 .handle()
-                .next
+                .next_enqueued
                 .store(ptr, Ordering::Release);
         }
     } else {

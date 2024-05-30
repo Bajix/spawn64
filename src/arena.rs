@@ -8,7 +8,6 @@ use std::{
 };
 
 use const_array_init::const_arr;
-use once_cell::race::OnceBox;
 
 use crate::runtime::{Scheduler, RUNTIME};
 
@@ -22,6 +21,11 @@ pub(crate) struct Index<'a> {
 }
 
 impl<'a> Index<'a> {
+    #[inline(always)]
+    pub(crate) fn new(arena: &'a TaskArena, idx: usize) -> Self {
+        Self { arena, idx }
+    }
+
     #[inline(always)]
     pub(crate) fn handle(&self) -> &TaskHandle {
         &self.arena.tasks[self.idx]
@@ -44,15 +48,15 @@ impl<'a> Index<'a> {
             if slot.has_task() {
                 let handle = slot.handle();
 
-                let next = handle.next.load(Ordering::Acquire) as *const ();
+                let next = handle.next_enqueued.load(Ordering::Acquire) as *const ();
 
                 if next.is_null() {
-                    let tail = RUNTIME.tail.swap(ptr as *mut (), Ordering::AcqRel);
+                    let tail = RUNTIME.poll_tail.swap(ptr as *mut (), Ordering::AcqRel);
 
                     if tail.is_null() {
                         Scheduler::schedule_polling(ptr as *mut ());
                     } else if tail.ne(&(ptr as *mut ())) {
-                        handle.next.store(tail, Ordering::Release);
+                        handle.next_enqueued.store(tail, Ordering::Release);
                     }
                 }
             }
@@ -81,12 +85,10 @@ impl<'a> Index<'a> {
 
         if poll.eq(&Some(Poll::Ready(()))) {
             *handle.task.get() = None;
-            self.arena
-                .occupancy
-                .fetch_and(!(1 << self.idx), Ordering::Release);
+            self.release_occupancy();
         }
 
-        handle.next.swap(ptr::null_mut(), Ordering::AcqRel)
+        handle.next_enqueued.swap(ptr::null_mut(), Ordering::AcqRel)
     }
 
     #[inline(always)]
@@ -109,27 +111,84 @@ impl<'a> Index<'a> {
 
     #[inline(always)]
     #[cfg(not(feature = "strict_provenance"))]
-    pub(crate) fn into_raw(self) -> *mut () {
+    pub(crate) fn into_raw(&self) -> *mut () {
         ((addr_of!(*self.arena) as usize) | self.idx) as *mut ()
     }
 
     #[inline(always)]
     #[cfg(feature = "strict_provenance")]
-    pub(crate) fn into_raw(self) -> *mut () {
+    pub(crate) fn into_raw(&self) -> *mut () {
         addr_of!(*self.arena).map_addr(|addr| addr | self.idx) as *mut ()
+    }
+
+    pub(crate) fn set_as_occupied(&self) -> u64 {
+        let occupancy_bit = 1 << self.idx;
+
+        self.arena
+            .occupancy
+            .fetch_or(occupancy_bit, Ordering::AcqRel)
+            | occupancy_bit
+    }
+
+    pub(crate) fn release_occupancy(&self) {
+        let occupancy = self
+            .arena
+            .occupancy
+            .fetch_add(!(1 << self.idx), Ordering::AcqRel);
+
+        if occupancy.eq(&u64::MAX) {
+            let ptr = self.into_raw();
+            let tail = RUNTIME.free_tail.swap(ptr, Ordering::AcqRel);
+
+            if !tail.is_null() {
+                unsafe {
+                    Index::from_raw(tail)
+                        .arena
+                        .next
+                        .store(ptr, Ordering::Release);
+                }
+            } else {
+                let next = RUNTIME.next.load(Ordering::Acquire);
+
+                unsafe {
+                    Index::from_raw(next)
+                        .arena
+                        .next
+                        .store(ptr, Ordering::Release);
+                }
+            }
+        }
+    }
+
+    pub(crate) fn next_index(&'a self, occupancy: u64) -> Index<'a> {
+        let low_bit = !occupancy & (occupancy.wrapping_add(1));
+
+        if low_bit.ne(&0) {
+            let idx = low_bit.trailing_zeros() as usize;
+            Index::new(&self.arena, idx)
+        } else {
+            let next = self.arena.next.swap(ptr::null_mut(), Ordering::AcqRel);
+
+            if !next.is_null() {
+                unsafe { Index::from_raw(next) }
+            } else {
+                let arena: &'static TaskArena = Box::leak(Box::new(TaskArena::new()));
+                Index::new(arena, 0)
+            }
+        }
     }
 }
 
 pub(crate) struct TaskHandle {
     pub(crate) task: UnsafeCell<Option<Pin<Box<dyn Future<Output = ()> + 'static>>>>,
-    pub(crate) next: AtomicPtr<()>,
+    pub(crate) next_enqueued: AtomicPtr<()>,
 }
 
 impl TaskHandle {
     pub(crate) const fn new() -> Self {
         TaskHandle {
             task: UnsafeCell::new(None),
-            next: AtomicPtr::new(ptr::null_mut()),
+            next_enqueued: AtomicPtr::new(ptr::null_mut()),
         }
     }
 }
@@ -138,7 +197,7 @@ impl TaskHandle {
 pub(crate) struct TaskArena {
     occupancy: AtomicU64,
     tasks: [TaskHandle; 64],
-    next: OnceBox<TaskArena>,
+    next: AtomicPtr<()>,
 }
 
 impl TaskArena {
@@ -147,38 +206,7 @@ impl TaskArena {
             occupancy: AtomicU64::new(0),
             #[allow(clippy::declare_interior_mutable_const)]
             tasks: const_arr!([TaskHandle; 64], |_| TaskHandle::new()),
-            next: OnceBox::new(),
-        }
-    }
-}
-
-impl TaskArena {
-    pub(crate) fn next_index(&self) -> Index {
-        let mut occupancy = self.occupancy.load(Ordering::Acquire);
-
-        let idx = loop {
-            // Isolate lowest clear bit. See https://docs.rs/bitintr/latest/bitintr/trait.Blcic.html
-            let least_significant_bit = !occupancy & (occupancy.wrapping_add(1));
-
-            if least_significant_bit.ne(&0) {
-                occupancy = self
-                    .occupancy
-                    .fetch_or(least_significant_bit, Ordering::AcqRel);
-
-                if (occupancy & least_significant_bit).eq(&0) {
-                    break least_significant_bit.trailing_zeros();
-                }
-            } else {
-                return self
-                    .next
-                    .get_or_init(|| Box::new(TaskArena::new()))
-                    .next_index();
-            }
-        };
-
-        Index {
-            arena: self,
-            idx: idx as usize,
+            next: AtomicPtr::new(ptr::null_mut()),
         }
     }
 }
