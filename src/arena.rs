@@ -1,6 +1,8 @@
 use std::{
+    alloc::{alloc_zeroed, Layout},
     cell::UnsafeCell,
     future::Future,
+    mem::MaybeUninit,
     pin::Pin,
     ptr::{self, addr_of},
     sync::atomic::{AtomicPtr, AtomicU64, Ordering},
@@ -13,6 +15,7 @@ use crate::runtime::{Scheduler, RUNTIME};
 
 const IDX: usize = (1 << 6) - 1;
 const IDX_MASK: usize = !IDX;
+const LAYOUT: Layout = Layout::new::<TaskArena>();
 
 #[derive(Clone, Copy)]
 pub(crate) struct Index<'a> {
@@ -73,18 +76,17 @@ impl<'a> Index<'a> {
     pub(crate) unsafe fn poll(&self) -> *mut () {
         let handle = self.handle();
 
-        let poll = match &mut *handle.task.get() {
-            Some(task) => {
-                let waker = Waker::from_raw(self.raw_waker());
-                let mut cx = Context::from_waker(&waker);
+        let poll = {
+            let task = unsafe { (&mut *handle.task.get()).assume_init_mut() };
 
-                Some(task.as_mut().poll(&mut cx))
-            }
-            None => None,
+            let waker = Waker::from_raw(self.raw_waker());
+            let mut cx = Context::from_waker(&waker);
+
+            task.as_mut().poll(&mut cx)
         };
 
-        if poll.eq(&Some(Poll::Ready(()))) {
-            *handle.task.get() = None;
+        if poll.eq(&Poll::Ready(())) {
+            unsafe { (&mut *handle.task.get()).assume_init_drop() };
             self.release_occupancy();
         }
 
@@ -121,6 +123,7 @@ impl<'a> Index<'a> {
         addr_of!(*self.arena).map_addr(|addr| addr | self.idx) as *mut ()
     }
 
+    #[inline(always)]
     pub(crate) fn set_as_occupied(&self) -> u64 {
         let occupancy_bit = 1 << self.idx;
 
@@ -130,7 +133,8 @@ impl<'a> Index<'a> {
             | occupancy_bit
     }
 
-    pub(crate) fn release_occupancy(&self) {
+    #[inline(always)]
+    fn release_occupancy(&self) {
         let occupancy = self
             .arena
             .occupancy
@@ -160,34 +164,33 @@ impl<'a> Index<'a> {
         }
     }
 
-    pub(crate) fn next_index(&'a self, occupancy: u64) -> Index<'a> {
+    #[inline(always)]
+    pub(crate) fn next_index(&'a self, occupancy: u64) -> *mut () {
         let low_bit = !occupancy & (occupancy.wrapping_add(1));
 
         if low_bit.ne(&0) {
-            let idx = low_bit.trailing_zeros() as usize;
-            Index::new(&self.arena, idx)
+            Index::new(&self.arena, low_bit.trailing_zeros() as usize).into_raw()
         } else {
             let next = self.arena.next.swap(ptr::null_mut(), Ordering::AcqRel);
 
             if !next.is_null() {
-                unsafe { Index::from_raw(next) }
+                next
             } else {
-                let arena: &'static TaskArena = Box::leak(Box::new(TaskArena::new()));
-                Index::new(arena, 0)
+                unsafe { alloc_zeroed(LAYOUT) as *mut () }
             }
         }
     }
 }
 
 pub(crate) struct TaskHandle {
-    pub(crate) task: UnsafeCell<Option<Pin<Box<dyn Future<Output = ()> + 'static>>>>,
+    pub(crate) task: UnsafeCell<MaybeUninit<Pin<Box<dyn Future<Output = ()>>>>>,
     pub(crate) next_enqueued: AtomicPtr<()>,
 }
 
 impl TaskHandle {
     pub(crate) const fn new() -> Self {
         TaskHandle {
-            task: UnsafeCell::new(None),
+            task: UnsafeCell::new(MaybeUninit::zeroed()),
             next_enqueued: AtomicPtr::new(ptr::null_mut()),
         }
     }

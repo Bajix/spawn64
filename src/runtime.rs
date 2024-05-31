@@ -1,5 +1,6 @@
 use std::{
     future::Future,
+    mem::MaybeUninit,
     ptr::{self, addr_of},
     sync::atomic::{AtomicPtr, Ordering},
 };
@@ -74,7 +75,7 @@ impl Scheduler {
 }
 
 pub(crate) struct Runtime {
-    pub(crate) poll_head: AtomicPtr<()>,
+    poll_head: AtomicPtr<()>,
     pub(crate) poll_tail: AtomicPtr<()>,
     pub(crate) free_tail: AtomicPtr<()>,
     pub(crate) next: AtomicPtr<()>,
@@ -129,10 +130,10 @@ where
 
     RUNTIME
         .next
-        .store(index.next_index(occupancy).into_raw(), Ordering::Release);
+        .store(index.next_index(occupancy), Ordering::Release);
 
     unsafe {
-        *index.handle().task.get() = Some(Box::pin(future));
+        *index.handle().task.get() = MaybeUninit::new(Box::pin(future));
     }
 
     let tail = RUNTIME.poll_tail.swap(ptr, Ordering::AcqRel);
